@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show DeviceOrientation, SystemChrome;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'Load.dart';
@@ -46,6 +47,27 @@ class WinRunnerWebView extends StatefulWidget {
 class _WinRunnerWebViewState extends State<WinRunnerWebView> {
   InAppWebViewController? _webViewController;
   bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    // Экран с WebView открывается только в горизонтальной ориентации.
+    _lockLandscapeOrientation();
+  }
+
+  Future<void> _lockLandscapeOrientation() async {
+    await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+  }
+
+  @override
+  void dispose() {
+    // Возвращаем поддержку всех ориентаций для остальной части приложения.
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    super.dispose();
+  }
 
   // Базовые настройки WebView.
   final InAppWebViewSettings _settings = InAppWebViewSettings(
