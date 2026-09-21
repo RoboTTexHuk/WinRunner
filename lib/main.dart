@@ -15,7 +15,8 @@ import 'package:flutter/services.dart'
     SystemChrome,
     SystemUiOverlayStyle,
     MethodCall,
-    VoidCallback;
+    VoidCallback,
+    DeviceOrientation;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:http/http.dart' as http;
 
@@ -26,7 +27,6 @@ import 'package:timezone/data/latest.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz_zone;
 import 'package:winrunner/pushRunner.dart';
 
-import 'Game.dart';
 import 'Load.dart';
 
 // ============================================================================
@@ -37,6 +37,8 @@ const String wrLoadedOnceKey = 'loaded_once';
 const String wrStatEndpoint = 'https://appdata.winurban.club/stat';
 const String wrCachedFcmKey = 'cached_fcm';
 const String wrCachedDeepKey = 'cached_deep_push_uri';
+const String wrSavedataKey = 'savedata';
+const String wrHarborDataScriptGroup = 'harbor-data';
 
 const Set<String> wrBankSchemes = {
   'td',
@@ -77,10 +79,6 @@ const Set<String> wrBankDomains = {
   'dominobank.com',
 };
 
-// ============================================================================
-// OneLink / AppsFlyer домены — НЕ открывать во внешнем браузере
-// ============================================================================
-
 const Set<String> wrOneLinkDomains = {
   'onelink.me',
   'app.appsflyer.com',
@@ -88,7 +86,6 @@ const Set<String> wrOneLinkDomains = {
   'af-link.com',
 };
 
-/// Проверяет, является ли URL ссылкой OneLink / AppsFlyer
 bool WrIsOneLinkUrl(Uri uri) {
   final String host = uri.host.toLowerCase();
   if (host.isEmpty) return false;
@@ -100,6 +97,35 @@ bool WrIsOneLinkUrl(Uri uri) {
     }
   }
   return false;
+}
+
+/// Unity WebGL (gamedata.*) — сюда нельзя инжектить Harbor JS.
+bool WrIsUnityGameUrl(Uri? uri) {
+  if (uri == null) return false;
+  final String host = uri.host.toLowerCase();
+  if (host.isEmpty) return false;
+  return host == 'gamedata.winurban.club' ||
+      host.endsWith('.gamedata.winurban.club') ||
+      host.startsWith('gamedata.');
+}
+
+bool WrIsUnityGameUrlString(String? value) {
+  if (value == null || value.trim().isEmpty) return false;
+  try {
+    return WrIsUnityGameUrl(Uri.parse(value));
+  } catch (_) {
+    return value.toLowerCase().contains('gamedata.winurban.club');
+  }
+}
+
+String WrJsUnityHostGuard() {
+  return r'''
+    var __harborHost = (location.hostname || '').toLowerCase();
+    if (__harborHost === 'gamedata.winurban.club' ||
+        __harborHost.indexOf('gamedata.') === 0) {
+      return;
+    }
+  ''';
 }
 
 // ============================================================================
@@ -141,6 +167,84 @@ class WrNetworkService {
 }
 
 // ============================================================================
+// JS builders: localStorage + sendRawData
+// ============================================================================
+
+String WrBuildLocalStorageJs({
+  required String key,
+  required Map<String, dynamic> data,
+}) {
+  final String jsKey = jsonEncode(key);
+  final String jsValue = jsonEncode(jsonEncode(data));
+  return '''
+    (function() {
+      try {
+        ${WrJsUnityHostGuard()}
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem($jsKey, $jsValue);
+          console.log('Harbor localStorage set', $jsKey);
+        }
+      } catch (e) {
+        console.log('localStorage.setItem error', e);
+      }
+    })();
+  ''';
+}
+
+String WrBuildSendRawDataJs(Map<String, dynamic> payload) {
+  final String wrJsonString = jsonEncode(payload);
+  final String jsSafeJson = jsonEncode(wrJsonString);
+  return '''
+    (function() {
+      try {
+        ${WrJsUnityHostGuard()}
+
+        var payloadStr = $jsSafeJson;
+        var delivered = false;
+
+        function trySend(reason) {
+          if (delivered) return true;
+          try {
+            var fn = null;
+            if (typeof sendRawData === 'function') {
+              fn = sendRawData;
+            } else if (window && typeof window.sendRawData === 'function') {
+              fn = window.sendRawData;
+            }
+            if (!fn) return false;
+            fn(payloadStr);
+            delivered = true;
+            console.log('Harbor sendRawData delivered via', reason);
+            return true;
+          } catch (e) {
+            console.log('sendRawData error', e);
+            return false;
+          }
+        }
+
+        if (trySend('immediate')) return;
+
+        var n = 0;
+        var timer = setInterval(function() {
+          n++;
+          if (trySend('poll-' + n) || n >= 40) {
+            clearInterval(timer);
+          }
+        }, 250);
+
+        document.addEventListener('DOMContentLoaded', function() { trySend('dom'); });
+        window.addEventListener('load', function() { trySend('load'); });
+        window.addEventListener('flutterInAppWebViewPlatformReady', function() {
+          trySend('platform-ready');
+        });
+      } catch (e) {
+        console.log('sendRawData bootstrap error', e);
+      }
+    })();
+  ''';
+}
+
+// ============================================================================
 // Утилита: одновременное сохранение JSON в localStorage и SharedPreferences
 // ============================================================================
 
@@ -153,12 +257,18 @@ Future<void> WrSaveJsonToLocalStorageAndPrefs({
 
   if (controller != null) {
     try {
-      await controller.evaluateJavascript(
-        source: "localStorage.setItem('$key', JSON.stringify($jsonString));",
-      );
+      final Uri? url = await controller.getUrl();
+      if (WrIsUnityGameUrl(url)) {
+        WrLoggerService()
+            .WrLogInfo('Skip localStorage inject on Unity page: $url');
+      } else {
+        await controller.evaluateJavascript(
+          source: WrBuildLocalStorageJs(key: key, data: data),
+        );
+      }
     } catch (e, st) {
-      WrLoggerService()
-          .WrLogError('WrSaveJsonToLocalStorageAndPrefs localStorage error: $e\n$st');
+      WrLoggerService().WrLogError(
+          'WrSaveJsonToLocalStorageAndPrefs localStorage error: $e\n$st');
     }
   }
 
@@ -188,8 +298,6 @@ class WrDeviceProfile {
   bool WrSafeAreaEnabled = false;
   String? WrSafeAreaColor;
 
-  bool safecasher = false;
-
   String? WrBaseUserAgent;
 
   Map<String, dynamic>? WrLastPushData;
@@ -200,7 +308,8 @@ class WrDeviceProfile {
     final DeviceInfoPlugin wrDeviceInfoPlugin = DeviceInfoPlugin();
 
     if (Platform.isAndroid) {
-      final AndroidDeviceInfo wrAndroidInfo = await wrDeviceInfoPlugin.androidInfo;
+      final AndroidDeviceInfo wrAndroidInfo =
+      await wrDeviceInfoPlugin.androidInfo;
       WrDeviceId = wrAndroidInfo.id;
       WrPlatformName = 'android';
       WrOsVersion = wrAndroidInfo.version.release;
@@ -225,14 +334,13 @@ class WrDeviceProfile {
     'instance_id': WrSessionId ?? 'missing_session',
     'platform': WrPlatformName ?? 'missing_system',
     'os_version': WrOsVersion ?? 'missing_build',
-    'app_version': '1.4.3' ?? 'missing_app',
+    'app_version': '1.4.3',
     'language': WrLanguageCode ?? 'en',
     'timezone': WrTimezoneName ?? 'UTC',
     'push_enabled': WrPushEnabled,
     'safe_area_native': WrSafeAreaEnabled,
     'useragent': WrBaseUserAgent ?? 'unknown_useragent',
     'savels': WrSavels ?? <String, dynamic>{},
-    'fpscashier': safecasher,
   };
 }
 
@@ -270,8 +378,8 @@ class WrAnalyticsSpyService {
     WrAppsFlyerSdk?.startSDK(
       onSuccess: () =>
           WrLoggerService().WrLogInfo('RetroCarAnalyticsSpy started'),
-      onError: (int code, String msg) =>
-          WrLoggerService().WrLogError('RetroCarAnalyticsSpy error $code: $msg'),
+      onError: (int code, String msg) => WrLoggerService()
+          .WrLogError('RetroCarAnalyticsSpy error $code: $msg'),
     );
 
     WrAppsFlyerSdk?.onInstallConversionData((dynamic value) {
@@ -587,7 +695,6 @@ class WrBosunViewModel {
         WrDeviceProfileInstance.WrBaseUserAgent ?? 'unknown_useragent',
         'push': WrDeviceProfileInstance.WrLastPushData ?? <String, dynamic>{},
         'deep': deepLink,
-        'fpscashier': WrDeviceProfileInstance.safecasher,
       },
     };
   }
@@ -621,12 +728,21 @@ class WrCourierService {
     return null;
   }
 
+  Future<bool> _isUnityNow(InAppWebViewController controller) async {
+    try {
+      final Uri? url = await controller.getUrl();
+      return WrIsUnityGameUrl(url);
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> WrPutDeviceToLocalStorage(String? token) async {
     final InAppWebViewController? wrController = await _waitForController();
     if (wrController == null) return;
 
     final Map<String, dynamic> wrMap = WrBosun.WrDeviceMap(token);
-    WrLoggerService().WrLogInfo("applocal (${jsonEncode(wrMap)});");
+    WrLoggerService().WrLogInfo('applocal (${jsonEncode(wrMap)});');
 
     await WrSaveJsonToLocalStorageAndPrefs(
       controller: wrController,
@@ -642,21 +758,63 @@ class WrCourierService {
     final InAppWebViewController? wrController = await _waitForController();
     if (wrController == null) return;
 
+    if (await _isUnityNow(wrController)) {
+      WrLoggerService().WrLogInfo('Skip sendRawData on Unity page');
+      return;
+    }
+
     final Map<String, dynamic> wrPayload =
     WrBosun.WrAppsFlyerPayload(token, deepLink: deepLink);
 
-    final String wrJsonString = jsonEncode(wrPayload);
-
-    WrLoggerService().WrLogInfo('SendRawData: $wrJsonString');
-
-    final String jsSafeJson = jsonEncode(wrJsonString);
-    final String jsCode = 'sendRawData($jsSafeJson);';
+    WrLoggerService().WrLogInfo('SendRawData: ${jsonEncode(wrPayload)}');
 
     try {
-      await wrController.evaluateJavascript(source: jsCode);
+      await wrController.evaluateJavascript(
+        source: WrBuildSendRawDataJs(wrPayload),
+      );
     } catch (e, st) {
       WrLoggerService()
           .WrLogError('WrSendRawToPage evaluateJavascript error: $e\n$st');
+    }
+  }
+
+  Future<void> WrSyncDataUserScripts({
+    required String? token,
+    String? deepLink,
+  }) async {
+    final InAppWebViewController? wrController = await _waitForController(
+      timeout: const Duration(seconds: 3),
+    );
+    if (wrController == null) return;
+
+    final Map<String, dynamic> deviceMap = WrBosun.WrDeviceMap(token);
+    final Map<String, dynamic> payload =
+    WrBosun.WrAppsFlyerPayload(token, deepLink: deepLink);
+
+    try {
+      await wrController.removeUserScriptsByGroupName(
+        groupName: wrHarborDataScriptGroup,
+      );
+    } catch (_) {}
+
+    try {
+      await wrController.addUserScript(
+        userScript: UserScript(
+          groupName: wrHarborDataScriptGroup,
+          source: WrBuildLocalStorageJs(key: 'app_data', data: deviceMap),
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      );
+      await wrController.addUserScript(
+        userScript: UserScript(
+          groupName: wrHarborDataScriptGroup,
+          source: WrBuildSendRawDataJs(payload),
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+        ),
+      );
+      WrLoggerService().WrLogInfo('Harbor data user scripts synced');
+    } catch (e, st) {
+      WrLoggerService().WrLogWarn('addUserScript failed: $e\n$st');
     }
   }
 }
@@ -675,7 +833,8 @@ Future<String> WrResolveFinalUrl(
     Uri wrCurrentUri = Uri.parse(startUrl);
 
     for (int wrIndex = 0; wrIndex < maxHops; wrIndex++) {
-      final HttpClientRequest wrRequest = await wrHttpClient.getUrl(wrCurrentUri);
+      final HttpClientRequest wrRequest =
+      await wrHttpClient.getUrl(wrCurrentUri);
       wrRequest.followRedirects = false;
       final HttpClientResponse wrResponse = await wrRequest.close();
 
@@ -708,8 +867,8 @@ Future<void> WrPostStat({
   required String event,
   required int timeStart,
   required String url,
-  required int timeFinish,
   required String appSid,
+  required int timeFinish,
   int? firstPageLoadTs,
 }) async {
   try {
@@ -752,8 +911,7 @@ bool WrShouldForceHttps(Uri uri) {
 Uri WrForceHttps(Uri uri) => uri.replace(scheme: 'https');
 
 // ============================================================================
-// Открытие неизвестных кастомных схем (otpauth, otpauth-migration и т.п.)
-// во внешнем приложении
+// Открытие неизвестных кастомных схем
 // ============================================================================
 
 Future<bool> WrTryOpenUnknownSchemeExternally(Uri uri) async {
@@ -917,15 +1075,10 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
   String? WrDeepLinkFromPush;
 
-  // FCM-токен, полученный ТОЛЬКО через канал com.example.fcm/push
-  // (AppDelegate.sendTokenToFlutter -> fcmPushDataChannel setPushData).
-  // Именно это значение используется для записи в SendRawData и в
-  // локальное хранилище — канал com.example.fcm/token для этого больше
-  // не используется.
   String? _pushChannelToken;
 
   String? _baseUserAgent;
-  String _currentUserAgent = "";
+  String _currentUserAgent = '';
   String? _currentUrl;
 
   String? _serverUserAgent;
@@ -948,6 +1101,12 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
   bool _isCurrentlyOnGoogle = false;
 
+  /// Harbor JS-хуки и loadedjs только при savedata == 'true'.
+  /// sendRawData / localStorage app_data — всегда, кроме Unity.
+  String _savedataFlag = 'false';
+
+  bool get _enableHarborLogic => _savedataFlag == 'true';
+
   static const MethodChannel _appsFlyerDeepLinkChannel =
   MethodChannel('appsflyer_deeplink_channel');
 
@@ -957,6 +1116,10 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     WrFirstPageTimestamp = DateTime.now().millisecondsSinceEpoch;
     _currentUrl = WrHomeUrl;
+
+    SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+    ]);
 
     Future<void>.delayed(const Duration(seconds: 2), () {
       if (mounted) {
@@ -985,6 +1148,16 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
   bool _isAboutBlankUri(Uri? uri) => _isAboutBlankUrl(uri?.toString());
 
+  Future<void> _loadSaveDataFlag() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      _savedataFlag = prefs.getString(wrSavedataKey) ?? 'false';
+      WrLoggerService().WrLogInfo('savedata loaded = $_savedataFlag');
+    } catch (e) {
+      _savedataFlag = 'false';
+    }
+  }
+
   void _bindAppsFlyerDeepLinkChannel() {
     _appsFlyerDeepLinkChannel.setMethodCallHandler(
           (MethodCall call) async {
@@ -994,9 +1167,9 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
             Map<String, dynamic> payload;
 
-            print(" Data Deepl link ${args.toString()}");
+            print(' Data Deepl link ${args.toString()}');
             if (args is Map) {
-              payload = Map<String, dynamic>.from(args as Map);
+              payload = Map<String, dynamic>.from(args);
             } else if (args is String) {
               payload = jsonDecode(args) as Map<String, dynamic>;
             } else {
@@ -1010,32 +1183,31 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
             final dynamic raw = payload['raw'];
             if (raw is Map) {
               final Map<String, dynamic> normalized =
-              Map<String, dynamic>.from(raw as Map);
+              Map<String, dynamic>.from(raw);
 
-              print("One Link Data $normalized");
+              print('One Link Data $normalized');
               WrAnalyticsSpyInstance.WrSetOneLinkData(normalized);
 
-              // === OneLink: извлекаем deep_link_value и навигируем внутри ===
               _handleOneLinkDeepNavigation(normalized);
             } else {
               WrAnalyticsSpyInstance.WrSetOneLinkData(payload);
               _handleOneLinkDeepNavigation(payload);
             }
+
+            unawaited(_shipDataToPage(reason: 'onelink'));
           } catch (e, st) {
-            WrLoggerService().WrLogError('Error in onDeepLink handler: $e\n$st');
+            WrLoggerService()
+                .WrLogError('Error in onDeepLink handler: $e\n$st');
           }
         }
       },
     );
   }
 
-  /// Обработка OneLink deep link — навигация внутри WebView, а не во внешний браузер
   void _handleOneLinkDeepNavigation(Map<String, dynamic> data) {
     try {
-      // Пытаемся извлечь URL для навигации из OneLink данных
       String? targetUrl;
 
-      // deep_link_value — стандартное поле AppsFlyer OneLink
       if (data.containsKey('deep_link_value') &&
           data['deep_link_value'] != null) {
         final String dlv = data['deep_link_value'].toString().trim();
@@ -1044,28 +1216,30 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
         }
       }
 
-      // af_dp — ещё одно стандартное поле
-      if (targetUrl == null && data.containsKey('af_dp') && data['af_dp'] != null) {
+      if (targetUrl == null &&
+          data.containsKey('af_dp') &&
+          data['af_dp'] != null) {
         final String afDp = data['af_dp'].toString().trim();
         if (afDp.startsWith('http://') || afDp.startsWith('https://')) {
           targetUrl = afDp;
         }
       }
 
-      // link — может быть финальным URL
-      if (targetUrl == null && data.containsKey('link') && data['link'] != null) {
+      if (targetUrl == null &&
+          data.containsKey('link') &&
+          data['link'] != null) {
         final String link = data['link'].toString().trim();
         if (link.startsWith('http://') || link.startsWith('https://')) {
           targetUrl = link;
         }
       }
 
-      // clickURL
       if (targetUrl == null &&
           data.containsKey('clickURL') &&
           data['clickURL'] != null) {
         final String clickUrl = data['clickURL'].toString().trim();
-        if (clickUrl.startsWith('http://') || clickUrl.startsWith('https://')) {
+        if (clickUrl.startsWith('http://') ||
+            clickUrl.startsWith('https://')) {
           targetUrl = clickUrl;
         }
       }
@@ -1075,7 +1249,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
             .WrLogInfo('OneLink deep navigation: loading $targetUrl in WebView');
         WrDeepLinkFromPush = targetUrl;
 
-        // Навигируем внутри WebView
         Future<void>.delayed(const Duration(milliseconds: 500), () {
           WrNavigateToUri(targetUrl!);
         });
@@ -1085,28 +1258,18 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                 'sending data to page via sendRawData');
       }
     } catch (e, st) {
-      WrLoggerService().WrLogError('_handleOneLinkDeepNavigation error: $e\n$st');
+      WrLoggerService()
+          .WrLogError('_handleOneLinkDeepNavigation error: $e\n$st');
     }
   }
 
   void _bindPushChannelFromAppDelegate() {
-    // ВАЖНО: сам MethodChannel('com.example.fcm/push') слушается ГЛОБАЛЬНО —
-    // через gWrBindPushChannel(), вызванный один раз в main(), ещё до
-    // runApp(). Установка здесь СВОЕГО обработчика на этом же канале —
-    // опасная ошибка: setMethodCallHandler на канале с тем же именем просто
-    // вытесняет предыдущий обработчик, а если этот экран (WrHarbor) ещё не
-    // успел смонтироваться, самый ранний вызов из AppDelegate (например,
-    // токен при холодном старте) потеряется, т.к. на канале ещё не было
-    // вообще никакого обработчика.
-    //
-    // Поэтому здесь мы только подписываемся на колбэки глобального моста и
-    // подхватываем то, что могло прийти раньше, чем этот экран появился.
     if (gWrLastPushData != null) {
       WrDeviceProfileInstance.WrLastPushData = gWrLastPushData;
     }
 
     final String? cachedUri =
-        (gWrLastPushData?['uri'] ?? gWrLastPushData?['deep_link'])?.toString();
+    (gWrLastPushData?['uri'] ?? gWrLastPushData?['deep_link'])?.toString();
     if (cachedUri != null && cachedUri.isNotEmpty) {
       WrDeepLinkFromPush = cachedUri;
     }
@@ -1117,10 +1280,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       WrLoggerService().WrLogInfo(
           'WrHarbor: применяем FCM-токен из com.example.fcm/push: $token');
 
-      // Токен пришёл через com.example.fcm/push — это единственный
-      // источник для SendRawData и локального хранилища.
-      WrPushDeviceInfo();
-      WrPushAppsFlyerData();
+      unawaited(_shipDataToPage(reason: 'fcm-token'));
     };
 
     gWrOnPushUri = (String uri) async {
@@ -1128,12 +1288,9 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       await WrSaveCachedDeep(uri);
     };
 
-    // Токен уже мог прийти ДО того, как этот экран смонтировался —
-    // подхватываем его сразу, не дожидаясь следующего push.
     if (gWrPushToken != null && gWrPushToken!.isNotEmpty) {
       _pushChannelToken = gWrPushToken;
-      WrPushDeviceInfo();
-      WrPushAppsFlyerData();
+      unawaited(_shipDataToPage(reason: 'cached-fcm'));
     }
   }
 
@@ -1151,12 +1308,12 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     const String googleUa = 'random';
 
     if (_currentUserAgent == googleUa) {
-      WrLoggerService().WrLogInfo('[UA] Already set to "random" for Google, skip');
+      WrLoggerService()
+          .WrLogInfo('[UA] Already set to "random" for Google, skip');
       return;
     }
 
-    WrLoggerService()
-        .WrLogInfo('[UA] Applying GOOGLE User-Agent: $googleUa');
+    WrLoggerService().WrLogInfo('[UA] Applying GOOGLE User-Agent: $googleUa');
 
     try {
       await WrWebViewController!.setSettings(
@@ -1235,7 +1392,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     if (_baseUserAgent == null || _baseUserAgent!.trim().isEmpty) {
       try {
         final ua = await WrWebViewController!.evaluateJavascript(
-          source: "navigator.userAgent",
+          source: 'navigator.userAgent',
         );
         if (ua is String && ua.trim().isNotEmpty) {
           _baseUserAgent = ua.trim();
@@ -1245,8 +1402,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
               .WrLogInfo('Base User-Agent detected: $_baseUserAgent');
         }
       } catch (e) {
-        WrLoggerService()
-            .WrLogWarn('Failed to get base userAgent from JS: $e');
+        WrLoggerService().WrLogWarn('Failed to get base userAgent from JS: $e');
       }
     }
 
@@ -1263,9 +1419,9 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     if (fullua != null && fullua.trim().isNotEmpty) {
       newUa = fullua.trim();
     } else if (uatail != null && uatail.trim().isNotEmpty) {
-      newUa = "${_baseUserAgent!}/${uatail.trim()}";
+      newUa = '${_baseUserAgent!}/${uatail.trim()}';
     } else {
-      newUa = "${_baseUserAgent!}";
+      newUa = _baseUserAgent!;
     }
 
     _serverUserAgent = newUa;
@@ -1290,8 +1446,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       return;
     }
 
-    WrLoggerService()
-        .WrLogInfo('Applying NORMAL WebView User-Agent: $targetUa');
+    WrLoggerService().WrLogInfo('Applying NORMAL WebView User-Agent: $targetUa');
 
     try {
       await WrWebViewController!.setSettings(
@@ -1300,8 +1455,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       _currentUserAgent = targetUa;
       print('[UA] NORMAL WEBVIEW USER AGENT: $_currentUserAgent');
     } catch (e) {
-      WrLoggerService().WrLogError(
-          'Error while setting normal User-Agent "$targetUa": $e');
+      WrLoggerService()
+          .WrLogError('Error while setting normal User-Agent "$targetUa": $e');
     }
   }
 
@@ -1324,7 +1479,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
     try {
       final ua = await WrWebViewController!.evaluateJavascript(
-        source: "navigator.userAgent",
+        source: 'navigator.userAgent',
       );
 
       if (ua is String) {
@@ -1395,7 +1550,10 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     WrStartWarmProgress();
     WrWireFcmHandlers();
     WrAnalyticsSpyInstance.WrStartTracking(
-      onUpdate: () => setState(() {}),
+      onUpdate: () {
+        if (mounted) setState(() {});
+        unawaited(_shipDataToPage(reason: 'appsflyer-update'));
+      },
     );
     WrBindNotificationTap();
     WrPrepareDeviceProfile();
@@ -1423,8 +1581,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
         WrNavigateToUri(wrUri);
 
-        await WrPushDeviceInfo();
-        await WrPushAppsFlyerData();
+        await _shipDataToPage(reason: 'fcm-opened');
       } else {
         WrResetHomeAfterDelay();
       }
@@ -1456,8 +1613,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                 (Route<dynamic> route) => false,
           );
 
-          await WrPushDeviceInfo();
-          await WrPushAppsFlyerData();
+          await _shipDataToPage(reason: 'notif-tap');
         }
       }
     });
@@ -1466,6 +1622,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   Future<void> WrPrepareDeviceProfile() async {
     try {
       await WrDeviceProfileInstance.WrInitialize();
+      await _loadSaveDataFlag();
 
       final FirebaseMessaging wrMessaging = FirebaseMessaging.instance;
       final NotificationSettings wrSettings =
@@ -1492,6 +1649,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
         WrBosun: WrBosunInstance!,
         WrGetWebViewController: () => WrWebViewController,
       );
+
+      await _shipDataToPage(reason: 'profile-ready');
     } catch (error) {
       WrLoggerService().WrLogError('prepareDeviceProfile fail: $error');
     }
@@ -1518,46 +1677,10 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   }
 
   String? _resolveTokenForShip() {
-    // Источник токена для SendRawData / локального хранилища — ТОЛЬКО
-    // данные, пришедшие через com.example.fcm/push из AppDelegate
-    // (см. _bindPushChannelFromAppDelegate). widget.WrSignal (канал
-    // com.example.fcm/token) больше не используется как источник.
     if (_pushChannelToken != null && _pushChannelToken!.isNotEmpty) {
       return _pushChannelToken;
     }
     return null;
-  }
-
-  Future<void> _sendAllDataToPageTwice() async {
-    await WrPushDeviceInfo();
-
-    Future<void>.delayed(const Duration(seconds: 6), () async {
-      await WrPushDeviceInfo();
-      await WrPushAppsFlyerData();
-    });
-  }
-
-  Future<void> WrPushDeviceInfo() async {
-    final String? wrToken = _resolveTokenForShip();
-
-    try {
-      await WrCourier?.WrPutDeviceToLocalStorage(wrToken);
-    } catch (error) {
-      WrLoggerService().WrLogError('pushDeviceInfo error: $error');
-    }
-  }
-
-  Future<void> WrPushAppsFlyerData() async {
-    final String? wrToken = _resolveTokenForShip();
-
-    try {
-      await WrCourier?.WrSendRawToPage(
-        wrToken,
-        deepLink: WrDeepLinkFromPush,
-      );
-    } catch (error) {
-      WrLoggerService().WrLogError('pushAppsFlyerData error: $error');
-    }
   }
 
   void WrStartWarmProgress() {
@@ -1608,7 +1731,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       Navigator.pushAndRemoveUntil(
         context,
         MaterialPageRoute<Widget>(
-          builder: (BuildContext context) => WrHarbor(WrSignal: widget.WrSignal),
+          builder: (BuildContext context) =>
+              WrHarbor(WrSignal: widget.WrSignal),
         ),
             (Route<dynamic> route) => false,
       );
@@ -1623,8 +1747,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     _parentInstallTimer?.cancel();
     _popupInstallTimer?.cancel();
 
-    // Отписываемся от глобального моста com.example.fcm/push, чтобы не
-    // держать колбэки на уничтоженный State.
     gWrOnPushToken = null;
     gWrOnPushUri = null;
 
@@ -1645,8 +1767,9 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     final String wrFull = uri.toString();
     final List<String> wrParts = wrFull.split('?');
     final String wrEmail = wrParts.first;
-    final Map<String, String> wrQueryParams =
-    wrParts.length > 1 ? Uri.splitQueryString(wrParts[1]) : <String, String>{};
+    final Map<String, String> wrQueryParams = wrParts.length > 1
+        ? Uri.splitQueryString(wrParts[1])
+        : <String, String>{};
 
     return Uri(
       scheme: 'mailto',
@@ -1660,16 +1783,15 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       final String scheme = mailto.scheme.toLowerCase();
       final String path = mailto.path.toLowerCase();
 
-      WrLoggerService()
-          .WrLogInfo('WrOpenMailExternal: scheme=$scheme path=$path uri=$mailto');
+      WrLoggerService().WrLogInfo(
+          'WrOpenMailExternal: scheme=$scheme path=$path uri=$mailto');
 
       if (scheme != 'mailto') {
         final bool ok = await launchUrl(
           mailto,
           mode: LaunchMode.externalApplication,
         );
-        WrLoggerService()
-            .WrLogInfo('WrOpenMailExternal: non-mailto result=$ok');
+        WrLoggerService().WrLogInfo('WrOpenMailExternal: non-mailto result=$ok');
         return ok;
       }
 
@@ -1717,10 +1839,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
         'su': wrQueryParams['subject']!,
       if ((wrQueryParams['body'] ?? '').isNotEmpty)
         'body': wrQueryParams['body']!,
-      if ((wrQueryParams['cc'] ?? '').isNotEmpty)
-        'cc': wrQueryParams['cc']!,
-      if ((wrQueryParams['bcc'] ?? '').isNotEmpty)
-        'bcc': wrQueryParams['bcc']!,
+      if ((wrQueryParams['cc'] ?? '').isNotEmpty) 'cc': wrQueryParams['cc']!,
+      if ((wrQueryParams['bcc'] ?? '').isNotEmpty) 'bcc': wrQueryParams['bcc']!,
     };
 
     return Uri.https('mail.google.com', '/mail/', wrParams);
@@ -1933,15 +2053,97 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     }
   }
 
-  void WrHandleServerSavedata(String savedata) {
+  Future<void> WrHandleServerSavedata(String savedata) async {
     print('onServerResponse savedata: $savedata');
+    _savedataFlag = savedata;
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setString(wrSavedataKey, savedata);
+    } catch (e) {
+      WrLoggerService().WrLogWarn('failed to persist savedata: $e');
+    }
 
-    if(savedata=='false'){
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => WinRunnerWebView(initialUrl: 'https://gamedata.winurban.club/', backgroundAsset: '', logoAsset: '',),
-        ),
+    await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+
+    if (WrWebViewController == null) return;
+
+    try {
+      final Uri? url = await WrWebViewController!.getUrl();
+      if (WrIsUnityGameUrl(url) || _isAboutBlankUri(url)) return;
+
+      if (_enableHarborLogic) {
+        _scheduleSafeInstall(WrWebViewController!, label: 'parent');
+      }
+
+      await _shipDataToPage(reason: 'savedata');
+    } catch (e, st) {
+      WrLoggerService()
+          .WrLogError('WrHandleServerSavedata install error: $e\n$st');
+    }
+  }
+
+  Future<void> _shipDataToPage({String reason = 'ship'}) async {
+    if (!mounted) return;
+
+    try {
+      final Uri? url = await WrWebViewController?.getUrl();
+      if (WrIsUnityGameUrl(url)) {
+        WrLoggerService()
+            .WrLogInfo('Skip shipData on Unity page ($reason): $url');
+        return;
+      }
+    } catch (_) {}
+
+    WrLoggerService().WrLogInfo('shipDataToPage reason=$reason');
+
+    await WrPushDeviceInfo();
+    await WrPushAppsFlyerData();
+
+    try {
+      await WrCourier?.WrSyncDataUserScripts(
+        token: _resolveTokenForShip(),
+        deepLink: WrDeepLinkFromPush,
       );
+    } catch (e) {
+      WrLoggerService().WrLogWarn('sync user scripts failed: $e');
+    }
+  }
+
+  Future<void> _sendAllDataToPageTwice() async {
+    await _shipDataToPage(reason: 'onload-0');
+
+    Future<void>.delayed(const Duration(seconds: 2), () async {
+      await _shipDataToPage(reason: 'onload-2s');
+    });
+
+    Future<void>.delayed(const Duration(seconds: 6), () async {
+      await _shipDataToPage(reason: 'onload-6s');
+    });
+  }
+
+  Future<void> WrPushDeviceInfo() async {
+    final String? wrToken = _resolveTokenForShip();
+
+    try {
+      await WrCourier?.WrPutDeviceToLocalStorage(wrToken);
+    } catch (error) {
+      WrLoggerService().WrLogError('pushDeviceInfo error: $error');
+    }
+  }
+
+  Future<void> WrPushAppsFlyerData() async {
+    final String? wrToken = _resolveTokenForShip();
+
+    try {
+      await WrCourier?.WrSendRawToPage(
+        wrToken,
+        deepLink: WrDeepLinkFromPush,
+      );
+    } catch (error) {
+      WrLoggerService().WrLogError('pushAppsFlyerData error: $error');
     }
   }
 
@@ -1963,8 +2165,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     final Map<String, dynamic> map =
     WrDeviceProfileInstance.WrToMap(fcmToken: token);
 
-    WrLoggerService()
-        .WrLogInfo('updateAppDataFromProfile: ${jsonEncode(map)}');
+    WrLoggerService().WrLogInfo('updateAppDataFromProfile: ${jsonEncode(map)}');
 
     await WrSaveJsonToLocalStorageAndPrefs(
       controller: controller,
@@ -1989,39 +2190,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
           setState(() {
             _buttonWhitelist = list;
           });
-          WrLoggerService()
-              .WrLogInfo('buttonswl updated: $_buttonWhitelist');
+          WrLoggerService().WrLogInfo('buttonswl updated: $_buttonWhitelist');
           _updateBackButtonVisibility();
-        }
-
-        if (adata.containsKey('fpscashier')) {
-          final dynamic fpsRaw = adata['fpscashier'];
-          bool? fpsValue;
-
-          if (fpsRaw is bool) {
-            fpsValue = fpsRaw;
-          } else if (fpsRaw is num) {
-            fpsValue = fpsRaw != 0;
-          } else if (fpsRaw is String) {
-            final String v = fpsRaw.toLowerCase().trim();
-            if (v == 'true' || v == '1' || v == 'yes') fpsValue = true;
-            if (v == 'false' || v == '0' || v == 'no') fpsValue = false;
-          }
-
-          if (fpsValue != null) {
-            final bool old = WrDeviceProfileInstance.safecasher;
-            WrDeviceProfileInstance.safecasher = fpsValue;
-            WrLoggerService().WrLogInfo(
-                'fpscashier updated from server payload: $fpsValue');
-
-            _updateAppDataInLocalStorageFromProfile();
-
-            if (!old && fpsValue && WrWebViewController != null) {
-              WrLoggerService().WrLogInfo(
-                  'fpscashier switched to true, installing JS hooks now');
-              _scheduleSafeInstall(WrWebViewController!, label: 'parent');
-            }
-          }
         }
 
         final dynamic savelsRaw = adata['savels'];
@@ -2040,8 +2210,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   }
 
   void _updateSafeAreaFromServerPayload(Map<dynamic, dynamic> root) {
-    WrLoggerService()
-        .WrLogInfo('SAFEAREA RAW PAYLOAD: ${jsonEncode(root)}');
+    WrLoggerService().WrLogInfo('SAFEAREA RAW PAYLOAD: ${jsonEncode(root)}');
 
     bool? safearea;
     String? bgLightHex;
@@ -2293,6 +2462,12 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     if (!mounted) return;
 
     try {
+      final Uri? url = await controller.getUrl();
+      if (WrIsUnityGameUrl(url)) {
+        WrLoggerService()
+            .WrLogInfo('Skip evaluateJavascript [$debugName] on Unity: $url');
+        return;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 80));
       if (!mounted) return;
       await controller.evaluateJavascript(source: source);
@@ -2302,6 +2477,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   }
 
   Future<void> _installJsErrorLogger(InAppWebViewController controller) async {
+    if (!_enableHarborLogic) return;
     await _safeEvaluateJavascript(
       controller,
       debugName: 'installJsErrorLogger',
@@ -2364,6 +2540,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       InAppWebViewController controller, {
         required String label,
       }) async {
+    if (!_enableHarborLogic) return;
     await _safeEvaluateJavascript(
       controller,
       debugName: 'installPostMessageBridge-$label',
@@ -2416,6 +2593,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   Future<void> _installCheckoutInterceptor(
       InAppWebViewController controller,
       ) async {
+    if (!_enableHarborLogic) return;
     await _safeEvaluateJavascript(
       controller,
       debugName: 'installCheckoutInterceptor',
@@ -2563,6 +2741,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
   Future<void> _installLocalStorageHook(
       InAppWebViewController controller) async {
+    if (!_enableHarborLogic) return;
     await _safeEvaluateJavascript(
       controller,
       debugName: 'installLocalStorageHook',
@@ -2600,12 +2779,21 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       }) async {
     if (controller == null) return;
     if (!mounted) return;
-    if (!WrDeviceProfileInstance.safecasher) {
-      print('WERLOG: safeInstallAll skipped ($label) because fpscashier=false');
-      return;
-    }
 
     try {
+      final Uri? url = await controller.getUrl();
+      if (WrIsUnityGameUrl(url)) {
+        WrLoggerService()
+            .WrLogInfo('Skip Harbor JS hooks on Unity page: $url');
+        return;
+      }
+
+      if (!_enableHarborLogic) {
+        WrLoggerService().WrLogInfo(
+            'Harbor logic disabled (savedata != true), skip install label=$label');
+        return;
+      }
+
       await _installJsErrorLogger(controller);
 
       await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -2741,7 +2929,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
           return false;
         }
 
-        // === OneLink: НЕ открываем во внешнем браузере ===
         if (WrIsOneLinkUrl(uri)) {
           WrLoggerService()
               .WrLogInfo('OneLink newTab detected, loading in WebView: $url');
@@ -2788,7 +2975,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       _currentUrl = wrUri.toString();
       await _updateBackButtonVisibility();
 
-      // === OneLink: загружаем внутри WebView, не открываем внешний браузер ===
       if (WrIsOneLinkUrl(wrUri)) {
         WrLoggerService().WrLogInfo(
             'OneLink onCreateWindow: loading in main WebView: $wrUri');
@@ -2797,8 +2983,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
         );
         return false;
       }
-
-      if (_isGoogleUrl(wrUri)) {}
 
       if (WrIsBankScheme(wrUri) ||
           ((wrUri.scheme == 'http' || wrUri.scheme == 'https') &&
@@ -2879,10 +3063,9 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       return false;
     }
 
-    // === OneLink в popup: загружаем в popup WebView ===
     if (uri != null && WrIsOneLinkUrl(uri)) {
-      WrLoggerService()
-          .WrLogInfo('OneLink popup onCreateWindow: loading in popup WebView: $uri');
+      WrLoggerService().WrLogInfo(
+          'OneLink popup onCreateWindow: loading in popup WebView: $uri');
       await controller.loadUrl(
         urlRequest: URLRequest(url: WebUri(uri.toString())),
       );
@@ -3071,8 +3254,9 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                         'initialUrl=${_popupUrl ?? _popupCreateAction?.request.url}',
                   );
 
-                  final String popupInitUrl =
-                      _popupUrl ?? _popupCreateAction?.request.url?.toString() ?? '';
+                  final String popupInitUrl = _popupUrl ??
+                      _popupCreateAction?.request.url?.toString() ??
+                      '';
                   if (popupInitUrl.isNotEmpty) {
                     final Uri? popupUri = Uri.tryParse(popupInitUrl);
                     if (popupUri != null && _isGoogleUrl(popupUri)) {
@@ -3167,18 +3351,26 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                   }
                   _refreshPopupCanGoBack();
                 },
-                onLoadStop: (controller, uri) async {
+                onLoadStop:
+                    (InAppWebViewController controller, Uri? uri) async {
                   print('WERLOG: popup onLoadStop url=$uri');
+
                   if (uri != null && !_isAboutBlankUri(uri)) {
+                    if (_isGoogleUrl(uri)) {
+                      await _applyGoogleUserAgentForPopup();
+                    }
+
                     if (mounted) {
                       setState(() {
                         _popupCurrentUrl = uri.toString();
                       });
                     }
+
+                    if (_enableHarborLogic && !WrIsUnityGameUrl(uri)) {
+                      _scheduleSafeInstall(controller, label: 'popup');
+                    }
                   }
-                  if (!_isAboutBlankUri(uri)) {
-                    _scheduleSafeInstall(controller, label: 'popup');
-                  }
+
                   _refreshPopupCanGoBack();
                 },
                 onUpdateVisitedHistory: (controller, url, isReload) async {
@@ -3211,13 +3403,11 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                   if (WrShouldForceHttps(uri)) {
                     final Uri httpsUri = WrForceHttps(uri);
                     await controller.loadUrl(
-                      urlRequest:
-                      URLRequest(url: WebUri(httpsUri.toString())),
+                      urlRequest: URLRequest(url: WebUri(httpsUri.toString())),
                     );
                     return NavigationActionPolicy.CANCEL;
                   }
 
-                  // === OneLink: разрешаем навигацию внутри popup ===
                   if (WrIsOneLinkUrl(uri)) {
                     WrLoggerService().WrLogInfo(
                         'OneLink popup shouldOverride: ALLOW in popup: $uri');
@@ -3243,8 +3433,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                   }
 
                   if (scheme == 'tel') {
-                    await launchUrl(uri,
-                        mode: LaunchMode.externalApplication);
+                    await launchUrl(uri, mode: LaunchMode.externalApplication);
                     return NavigationActionPolicy.CANCEL;
                   }
 
@@ -3320,12 +3509,14 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
     final Widget webView = Stack(
       children: <Widget>[
         if (WrCoverVisible)
-          const Center(child: WinRunnerLoadingScreen(
-            backgroundAsset: 'assets/bg_city.png',
-            logoAsset: 'assets/logo_winrunner.png',
-            loadingText: 'Loading...',
+          const Center(
+            child: WinRunnerLoadingScreen(
+              backgroundAsset: 'assets/bg_city.png',
+              logoAsset: 'assets/logo_winrunner.png',
+              loadingText: 'Loading...',
+            ),
           )
-          )else
+        else
           Container(
             color: bgColor,
             child: Stack(
@@ -3353,7 +3544,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
                     try {
                       final ua = await controller.evaluateJavascript(
-                        source: "navigator.userAgent",
+                        source: 'navigator.userAgent',
                       );
                       if (ua is String && ua.trim().isNotEmpty) {
                         _baseUserAgent = ua.trim();
@@ -3372,6 +3563,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
                     await _applyNormalUserAgentIfNeeded();
 
+                    unawaited(_shipDataToPage(reason: 'webview-created'));
+
                     controller.addJavaScriptHandler(
                       handlerName: 'NcupLocalStorageSetItem',
                       callback: (List<dynamic> args) async {
@@ -3379,10 +3572,8 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                           if (args.isEmpty) return null;
                           final dynamic raw = args.first;
                           if (raw is Map) {
-                            final String key =
-                                raw['key']?.toString() ?? '';
-                            final String value =
-                                raw['value']?.toString() ?? '';
+                            final String key = raw['key']?.toString() ?? '';
+                            final String value = raw['value']?.toString() ?? '';
                             if (key.isNotEmpty) {
                               final SharedPreferences prefs =
                               await SharedPreferences.getInstance();
@@ -3404,7 +3595,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       callback: (List<dynamic> args) async {
                         if (args.isEmpty) return null;
 
-                        print("Get Data server $args");
+                        print('Get Data server $args');
 
                         try {
                           dynamic first = args[0];
@@ -3421,7 +3612,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                             final Map<dynamic, dynamic> root = first;
 
                             if (root['savedata'] != null) {
-                              WrHandleServerSavedata(
+                              await WrHandleServerSavedata(
                                   root['savedata'].toString());
                               await _handleCheckoutAction(root['savedata']);
                             }
@@ -3433,12 +3624,12 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                             await _applyNormalUserAgentIfNeeded();
 
                             try {
-                              if (!_loadedJsExecutedOnce) {
+                              if (!_loadedJsExecutedOnce &&
+                                  _enableHarborLogic) {
                                 final dynamic adataRaw = root['adata'];
                                 if (adataRaw is Map) {
                                   final Map adata = adataRaw;
-                                  final dynamic loadedJsRaw =
-                                  adata['loadedjs'];
+                                  final dynamic loadedJsRaw = adata['loadedjs'];
                                   if (loadedJsRaw != null) {
                                     final String loadedJs =
                                     loadedJsRaw.toString().trim();
@@ -3452,6 +3643,11 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                                         const Duration(seconds: 6),
                                             () async {
                                           if (!mounted) return;
+                                          if (!_enableHarborLogic) {
+                                            WrLoggerService().WrLogInfo(
+                                                'Skipping loadedjs: savedata != true');
+                                            return;
+                                          }
                                           if (_loadedJsExecutedOnce) {
                                             WrLoggerService().WrLogInfo(
                                                 'Skipping loadedjs: already executed once');
@@ -3462,6 +3658,16 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                                                 'Skipping loadedjs execution: controller is null');
                                             return;
                                           }
+                                          try {
+                                            final Uri? url =
+                                            await WrWebViewController!
+                                                .getUrl();
+                                            if (WrIsUnityGameUrl(url)) {
+                                              WrLoggerService().WrLogInfo(
+                                                  'Skipping loadedjs on Unity page: $url');
+                                              return;
+                                            }
+                                          } catch (_) {}
                                           final String? jsToRun =
                                               _pendingLoadedJs;
                                           if (jsToRun == null ||
@@ -3487,7 +3693,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                                 }
                               } else {
                                 WrLoggerService().WrLogInfo(
-                                    'loadedjs ignored: already executed once earlier');
+                                    'loadedjs ignored: already executed or savedata != true');
                               }
                             } catch (e, st) {
                               WrLoggerService().WrLogError(
@@ -3511,8 +3717,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                             await _handleCheckoutAction(args.first);
                           }
                         } catch (e) {
-                          print(
-                              'WERLOG: MAIN NcupCheckoutAction error: $e');
+                          print('WERLOG: MAIN NcupCheckoutAction error: $e');
                         }
                         return null;
                       },
@@ -3572,6 +3777,11 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
                       await _updateBackButtonVisibility();
 
+                      if (!WrIsUnityGameUrl(wrViewUri) &&
+                          !_isAboutBlankUri(wrViewUri)) {
+                        unawaited(WrPushDeviceInfo());
+                      }
+
                       if (WrIsBareEmail(wrViewUri)) {
                         try {
                           await controller.stopLoading();
@@ -3619,8 +3829,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       return;
                     }
 
-                    final int wrNow =
-                        DateTime.now().millisecondsSinceEpoch;
+                    final int wrNow = DateTime.now().millisecondsSinceEpoch;
                     final String wrEvent =
                         'InAppWebViewError(code=$code, message=$message)';
 
@@ -3648,8 +3857,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       return;
                     }
 
-                    final int wrNow =
-                        DateTime.now().millisecondsSinceEpoch;
+                    final int wrNow = DateTime.now().millisecondsSinceEpoch;
                     final String wrEvent =
                         'WebResourceError(code=$error, message=$wrDescription)';
 
@@ -3673,13 +3881,23 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       await _switchUserAgentForUrl(uri);
                     }
 
-                    if (!_isAboutBlankUri(uri)) {
+                    final bool isUnity = WrIsUnityGameUrl(uri);
+
+                    if (!_isAboutBlankUri(uri) &&
+                        !isUnity &&
+                        _enableHarborLogic) {
                       _scheduleSafeInstall(controller, label: 'parent');
+                    } else if (isUnity) {
+                      WrLoggerService().WrLogInfo(
+                          'Unity page loaded — skip all Harbor injections: $uri');
                     }
 
                     await debugPrintCurrentUserAgent();
 
-                    await _sendAllDataToPageTwice();
+                    if (!isUnity && !_isAboutBlankUri(uri)) {
+                      await _sendAllDataToPageTwice();
+                    }
+
                     await _updateBackButtonVisibility();
 
                     Future<void>.delayed(
@@ -3692,16 +3910,14 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       },
                     );
                   },
-                  onUpdateVisitedHistory:
-                      (controller, url, isReload) async {
+                  onUpdateVisitedHistory: (controller, url, isReload) async {
                     if (url != null && !_isAboutBlankUri(url)) {
                       _currentUrl = url.toString();
                       await _updateBackButtonVisibility();
                       await _switchUserAgentForUrl(url);
                     }
                   },
-                  shouldOverrideUrlLoading:
-                      (InAppWebViewController controller,
+                  shouldOverrideUrlLoading: (InAppWebViewController controller,
                       NavigationAction action) async {
                     final Uri? wrUri = action.request.url;
                     if (wrUri == null) {
@@ -3724,7 +3940,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       return NavigationActionPolicy.CANCEL;
                     }
 
-                    // === OneLink: ВСЕГДА разрешаем навигацию внутри WebView ===
                     if (WrIsOneLinkUrl(wrUri)) {
                       WrLoggerService().WrLogInfo(
                           'OneLink shouldOverride: ALLOW in WebView: $wrUri');
@@ -3769,8 +3984,7 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                           Navigator.push(
                             context,
                             MaterialPageRoute(
-                              builder: (_) =>
-                                  WrAdobeRedirectScreen(uri: wrUri),
+                              builder: (_) => WrAdobeRedirectScreen(uri: wrUri),
                             ),
                           );
                         }
@@ -3788,11 +4002,10 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                     }
 
                     final String host = wrUri.host.toLowerCase();
-                    final bool wrIsSocial =
-                        host.endsWith('facebook.com') ||
-                            host.endsWith('instagram.com') ||
-                            host.endsWith('twitter.com') ||
-                            host.endsWith('x.com');
+                    final bool wrIsSocial = host.endsWith('facebook.com') ||
+                        host.endsWith('instagram.com') ||
+                        host.endsWith('twitter.com') ||
+                        host.endsWith('x.com');
 
                     if (wrIsSocial) {
                       await WrOpenExternal(wrUri);
@@ -3831,12 +4044,14 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                 ),
                 Visibility(
                   visible: !WrVeilVisible,
-                  child:  Center(child: WinRunnerLoadingScreen(
-    backgroundAsset: 'assets/bg_city.png',
-    logoAsset: 'assets/logo_winrunner.png',
-    loadingText: 'Loading...',
-    ),
-                )),
+                  child: const Center(
+                    child: WinRunnerLoadingScreen(
+                      backgroundAsset: 'assets/bg_city.png',
+                      logoAsset: 'assets/logo_winrunner.png',
+                      loadingText: 'Loading...',
+                    ),
+                  ),
+                ),
                 if (_isPopupVisible &&
                     (_popupUrl != null || _popupCreateAction != null))
                   _buildPopupWebView(),
@@ -3924,7 +4139,7 @@ class WrAdobeRedirectScreen extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                "Go to the App Store and download the app.",
+                'Go to the App Store and download the app.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: Colors.white,
@@ -3944,15 +4159,7 @@ class WrAdobeRedirectScreen extends StatelessWidget {
 // ============================================================================
 // Глобальный мост для com.example.fcm/push
 // ============================================================================
-//
-// Регистрируется ОДИН раз в main(), ещё до первого runApp(), потому что
-// нативная сторона (AppDelegate) может прислать FCM-токен через этот канал
-// очень рано — до того, как экран WrHarbor (единственное место, где раньше
-// стоял обработчик этого канала) вообще будет создан. Если в этот момент
-// на канале ещё нет обработчика, native invokeMethod просто теряется.
-// Поэтому обработчик живёт здесь, на уровне файла, и просто запоминает
-// последние данные + уведомляет текущий активный WrHarbor (если он уже
-// смонтирован) через колбэки gWrOnPushToken/gWrOnPushUri.
+
 String? gWrPushToken;
 String? gWrAttStatus;
 Map<String, dynamic>? gWrLastPushData;
@@ -3972,7 +4179,7 @@ void gWrBindPushChannel() {
       Map<String, dynamic> pushData;
       if (call.arguments is Map) {
         pushData = Map<String, dynamic>.from(call.arguments as Map);
-        print("Get Push Data $pushData");
+        print('Get Push Data $pushData');
       } else if (call.arguments is String) {
         pushData =
         jsonDecode(call.arguments as String) as Map<String, dynamic>;
@@ -4004,7 +4211,8 @@ void gWrBindPushChannel() {
             .WrLogInfo('ATT status from AppDelegate: $gWrAttStatus');
       }
     } catch (e, st) {
-      WrLoggerService().WrLogError('gWrBindPushChannel handler error: $e\n$st');
+      WrLoggerService()
+          .WrLogError('gWrBindPushChannel handler error: $e\n$st');
     }
   });
 }
@@ -4016,9 +4224,6 @@ void gWrBindPushChannel() {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Регистрируем канал com.example.fcm/push как можно раньше — ещё до
-  // Firebase.initializeApp() и runApp() — чтобы не потерять FCM-токен,
-  // если AppDelegate пришлёт его совсем рано (см. gWrBindPushChannel).
   gWrBindPushChannel();
 
   await Firebase.initializeApp();
@@ -4029,6 +4234,10 @@ Future<void> main() async {
   }
 
   tz_data.initializeTimeZones();
+
+  await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+    DeviceOrientation.portraitUp,
+  ]);
 
   runApp(
     const MaterialApp(
