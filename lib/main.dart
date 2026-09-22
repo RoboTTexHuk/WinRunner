@@ -37,7 +37,6 @@ const String wrLoadedOnceKey = 'loaded_once';
 const String wrStatEndpoint = 'https://appdata.winurban.club/stat';
 const String wrCachedFcmKey = 'cached_fcm';
 const String wrCachedDeepKey = 'cached_deep_push_uri';
-const String wrSavedataKey = 'savedata';
 const String wrHarborDataScriptGroup = 'harbor-data';
 
 const Set<String> wrBankSchemes = {
@@ -1013,9 +1012,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   bool _isOpeningExternalNewTab = false;
   final Set<String> _handledNewTabUrls = <String>{};
 
-  Timer? _parentInstallTimer;
-  Timer? _popupInstallTimer;
-
   final String WrHomeUrl = 'https://appdata.winurban.club/';
 
   int WrWebViewKeyCounter = 0;
@@ -1088,10 +1084,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
 
   bool _startupSendRawDone = false;
 
-  String? _pendingLoadedJs;
-
-  bool _loadedJsExecutedOnce = false;
-
   bool _isInGoogleAuth = false;
 
   List<String> _buttonWhitelist = <String>[];
@@ -1100,12 +1092,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   bool _backButtonHiddenAfterTap = false;
 
   bool _isCurrentlyOnGoogle = false;
-
-  /// Harbor JS-хуки и loadedjs только при savedata == 'true'.
-  /// sendRawData / localStorage app_data — всегда, кроме Unity.
-  String _savedataFlag = 'false';
-
-  bool get _enableHarborLogic => _savedataFlag == 'true';
 
   static const MethodChannel _appsFlyerDeepLinkChannel =
   MethodChannel('appsflyer_deeplink_channel');
@@ -1147,16 +1133,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   }
 
   bool _isAboutBlankUri(Uri? uri) => _isAboutBlankUrl(uri?.toString());
-
-  Future<void> _loadSaveDataFlag() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      _savedataFlag = prefs.getString(wrSavedataKey) ?? 'false';
-      WrLoggerService().WrLogInfo('savedata loaded = $_savedataFlag');
-    } catch (e) {
-      _savedataFlag = 'false';
-    }
-  }
 
   void _bindAppsFlyerDeepLinkChannel() {
     _appsFlyerDeepLinkChannel.setMethodCallHandler(
@@ -1622,7 +1598,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   Future<void> WrPrepareDeviceProfile() async {
     try {
       await WrDeviceProfileInstance.WrInitialize();
-      await _loadSaveDataFlag();
 
       final FirebaseMessaging wrMessaging = FirebaseMessaging.instance;
       final NotificationSettings wrSettings =
@@ -1743,9 +1718,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     WrWarmTimer.cancel();
-
-    _parentInstallTimer?.cancel();
-    _popupInstallTimer?.cancel();
 
     gWrOnPushToken = null;
     gWrOnPushUri = null;
@@ -2050,38 +2022,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       );
     } catch (error) {
       return false;
-    }
-  }
-
-  Future<void> WrHandleServerSavedata(String savedata) async {
-    print('onServerResponse savedata: $savedata');
-    _savedataFlag = savedata;
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setString(wrSavedataKey, savedata);
-    } catch (e) {
-      WrLoggerService().WrLogWarn('failed to persist savedata: $e');
-    }
-
-    await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-
-    if (WrWebViewController == null) return;
-
-    try {
-      final Uri? url = await WrWebViewController!.getUrl();
-      if (WrIsUnityGameUrl(url) || _isAboutBlankUri(url)) return;
-
-      if (_enableHarborLogic) {
-        _scheduleSafeInstall(WrWebViewController!, label: 'parent');
-      }
-
-      await _shipDataToPage(reason: 'savedata');
-    } catch (e, st) {
-      WrLoggerService()
-          .WrLogError('WrHandleServerSavedata install error: $e\n$st');
     }
   }
 
@@ -2451,384 +2391,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
       mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
       allowsBackForwardNavigationGestures: true,
     );
-  }
-
-  Future<void> _safeEvaluateJavascript(
-      InAppWebViewController? controller, {
-        required String source,
-        String debugName = 'js',
-      }) async {
-    if (controller == null) return;
-    if (!mounted) return;
-
-    try {
-      final Uri? url = await controller.getUrl();
-      if (WrIsUnityGameUrl(url)) {
-        WrLoggerService()
-            .WrLogInfo('Skip evaluateJavascript [$debugName] on Unity: $url');
-        return;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 80));
-      if (!mounted) return;
-      await controller.evaluateJavascript(source: source);
-    } catch (e) {
-      print('WERLOG: safeEvaluateJavascript error [$debugName]: $e');
-    }
-  }
-
-  Future<void> _installJsErrorLogger(InAppWebViewController controller) async {
-    if (!_enableHarborLogic) return;
-    await _safeEvaluateJavascript(
-      controller,
-      debugName: 'installJsErrorLogger',
-      source: r'''
-        (function() {
-          if (window.__ncupJsLoggerInstalled) return;
-          window.__ncupJsLoggerInstalled = true;
-
-          function serializeError(err) {
-            try {
-              if (!err) return null;
-              var plain = {};
-              Object.getOwnPropertyNames(err).forEach(function(key) {
-                plain[key] = err[key];
-              });
-              return plain;
-            } catch (_) {
-              return { message: String(err) };
-            }
-          }
-
-          window.onerror = function(message, source, lineno, colno, error) {
-            try {
-              var payload = {
-                type: 'onerror',
-                message: String(message || ''),
-                source: String(source || ''),
-                lineno: lineno || 0,
-                colno: colno || 0,
-                error: serializeError(error)
-              };
-              if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
-                window.flutter_inappwebview.callHandler('NcupJSLogger', payload);
-              }
-            } catch (e) {
-              console.log('NcupJSLogger onerror inner fail', e);
-            }
-          };
-
-          window.addEventListener('unhandledrejection', function(event) {
-            try {
-              var reason = event.reason;
-              var payload = {
-                type: 'unhandledrejection',
-                reason: serializeError(reason) || { message: String(reason || '') }
-              };
-              if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
-                window.flutter_inappwebview.callHandler('NcupJSLogger', payload);
-              }
-            } catch (e) {
-              console.log('NcupJSLogger unhandledrejection inner fail', e);
-            }
-          });
-        })();
-      ''',
-    );
-  }
-
-  Future<void> _installPostMessageBridge(
-      InAppWebViewController controller, {
-        required String label,
-      }) async {
-    if (!_enableHarborLogic) return;
-    await _safeEvaluateJavascript(
-      controller,
-      debugName: 'installPostMessageBridge-$label',
-      source: '''
-        (function() {
-          if (window.__ncupPostMessageBridgeInstalled_$label) return;
-          window.__ncupPostMessageBridgeInstalled_$label = true;
-
-          window.addEventListener('message', function(event) {
-            try {
-              var dataRaw = event.data;
-              var dataString;
-              try {
-                dataString = JSON.stringify(dataRaw);
-              } catch (e) {
-                dataString = String(dataRaw);
-              }
-
-              var hasBridge = !!(window.flutter_inappwebview && window.flutter_inappwebview.callHandler);
-
-              var payload = {
-                label: '$label',
-                origin: String(event.origin || ''),
-                data: dataString,
-                href: String(window.location.href || '')
-              };
-
-              if (hasBridge) {
-                window.flutter_inappwebview.callHandler('NcupPostMessage', payload);
-              }
-
-              try {
-                var parsed = dataRaw;
-                if (typeof parsed === 'string') {
-                  parsed = JSON.parse(parsed);
-                }
-                if (parsed && parsed.type === 'newTab' && parsed.url) {
-                  if (hasBridge) {
-                    window.flutter_inappwebview.callHandler('NcupCheckoutAction', parsed);
-                  }
-                }
-              } catch (parseErr) {}
-            } catch (e) {}
-          });
-        })();
-      ''',
-    );
-  }
-
-  Future<void> _installCheckoutInterceptor(
-      InAppWebViewController controller,
-      ) async {
-    if (!_enableHarborLogic) return;
-    await _safeEvaluateJavascript(
-      controller,
-      debugName: 'installCheckoutInterceptor',
-      source: r'''
-        (function() {
-          if (window.__ncupCheckoutInterceptorInstalled) return;
-          window.__ncupCheckoutInterceptorInstalled = true;
-
-          function sendToFlutter(data) {
-            try {
-              if (!data || typeof data !== 'object') return;
-              if (data.type === 'newTab' && data.url) {
-                console.log('[NCUP checkout interceptor] newTab:', data.url);
-                if (
-                  window.flutter_inappwebview &&
-                  window.flutter_inappwebview.callHandler
-                ) {
-                  window.flutter_inappwebview.callHandler(
-                    'NcupCheckoutAction',
-                    data
-                  );
-                }
-              }
-            } catch (e) {
-              console.log('[NCUP checkout interceptor] send error', e);
-            }
-          }
-
-          function tryParseMaybeJson(value) {
-            try {
-              if (!value) return null;
-              if (typeof value === 'object') {
-                return value;
-              }
-              if (typeof value === 'string') {
-                return JSON.parse(value);
-              }
-              return null;
-            } catch (e) {
-              return null;
-            }
-          }
-
-          function tryHandlePayload(payload) {
-            try {
-              var data = tryParseMaybeJson(payload);
-              if (!data) return;
-
-              if (Array.isArray(data)) {
-                data.forEach(function(item) {
-                  if (item && item.type === 'newTab' && item.url) {
-                    sendToFlutter(item);
-                  }
-                });
-                return;
-              }
-
-              if (data.type === 'newTab' && data.url) {
-                sendToFlutter(data);
-                return;
-              }
-
-              if (data.savedata) {
-                var saved = tryParseMaybeJson(data.savedata);
-                if (saved && saved.type === 'newTab' && saved.url) {
-                  sendToFlutter(saved);
-                  return;
-                }
-              }
-
-              if (data.data) {
-                var nested = tryParseMaybeJson(data.data);
-                if (nested && nested.type === 'newTab' && nested.url) {
-                  sendToFlutter(nested);
-                  return;
-                }
-              }
-
-              if (data.content) {
-                var content = tryParseMaybeJson(data.content);
-                if (content && content.type === 'newTab' && content.url) {
-                  sendToFlutter(content);
-                  return;
-                }
-              }
-            } catch (e) {
-              console.log('[NCUP checkout interceptor] handle error', e);
-            }
-          }
-
-          var originalFetch = window.fetch;
-          if (originalFetch) {
-            window.fetch = function() {
-              return originalFetch.apply(this, arguments).then(function(response) {
-                try {
-                  var cloned = response.clone();
-                  cloned.text().then(function(text) {
-                    tryHandlePayload(text);
-                  }).catch(function() {});
-                } catch (e) {}
-                return response;
-              });
-            };
-          }
-
-          var OriginalXHR = window.XMLHttpRequest;
-          if (OriginalXHR) {
-            window.XMLHttpRequest = function() {
-              var xhr = new OriginalXHR();
-              var originalOpen = xhr.open;
-              var originalSend = xhr.send;
-
-              xhr.open = function() {
-                return originalOpen.apply(xhr, arguments);
-              };
-
-              xhr.send = function() {
-                xhr.addEventListener('load', function() {
-                  try {
-                    tryHandlePayload(xhr.responseText);
-                  } catch (e) {}
-                });
-                return originalSend.apply(xhr, arguments);
-              };
-
-              return xhr;
-            };
-          }
-
-          var originalOpen = window.open;
-          window.open = function(url, target, features) {
-            try {
-              console.log('[NCUP window.open intercepted]', url, target, features);
-            } catch (e) {}
-
-            if (originalOpen) {
-              return originalOpen.apply(window, arguments);
-            }
-            return null;
-          };
-        })();
-      ''',
-    );
-  }
-
-  Future<void> _installLocalStorageHook(
-      InAppWebViewController controller) async {
-    if (!_enableHarborLogic) return;
-    await _safeEvaluateJavascript(
-      controller,
-      debugName: 'installLocalStorageHook',
-      source: r'''
-        (function() {
-          if (window.__ncupLocalStorageHookInstalled) return;
-          window.__ncupLocalStorageHookInstalled = true;
-
-          try {
-            var originalSetItem = window.localStorage.setItem;
-            window.localStorage.setItem = function(key, value) {
-              try {
-                if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
-                  window.flutter_inappwebview.callHandler('NcupLocalStorageSetItem', {
-                    key: String(key),
-                    value: String(value)
-                  });
-                }
-              } catch (e) {
-                console.log('Ncup localStorage hook error', e);
-              }
-              return originalSetItem.apply(this, arguments);
-            };
-          } catch (e) {
-            console.log('Ncup localStorage hook init error', e);
-          }
-        })();
-      ''',
-    );
-  }
-
-  Future<void> _safeInstallAll(
-      InAppWebViewController? controller, {
-        required String label,
-      }) async {
-    if (controller == null) return;
-    if (!mounted) return;
-
-    try {
-      final Uri? url = await controller.getUrl();
-      if (WrIsUnityGameUrl(url)) {
-        WrLoggerService()
-            .WrLogInfo('Skip Harbor JS hooks on Unity page: $url');
-        return;
-      }
-
-      if (!_enableHarborLogic) {
-        WrLoggerService().WrLogInfo(
-            'Harbor logic disabled (savedata != true), skip install label=$label');
-        return;
-      }
-
-      await _installJsErrorLogger(controller);
-
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      if (!mounted) return;
-      await _installPostMessageBridge(controller, label: label);
-
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      if (!mounted) return;
-      await _installCheckoutInterceptor(controller);
-
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      if (!mounted) return;
-      await _installLocalStorageHook(controller);
-    } catch (e) {
-      print('WERLOG: safeInstallAll error label=$label error=$e');
-    }
-  }
-
-  void _scheduleSafeInstall(
-      InAppWebViewController controller, {
-        required String label,
-      }) {
-    if (label == 'popup') {
-      _popupInstallTimer?.cancel();
-      _popupInstallTimer = Timer(const Duration(milliseconds: 450), () async {
-        if (!mounted) return;
-        await _safeInstallAll(controller, label: label);
-      });
-    } else {
-      _parentInstallTimer?.cancel();
-      _parentInstallTimer = Timer(const Duration(milliseconds: 250), () async {
-        if (!mounted) return;
-        await _safeInstallAll(controller, label: label);
-      });
-    }
   }
 
   Map<String, dynamic>? _tryDecodeMap(dynamic value) {
@@ -3263,69 +2825,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       await _applyGoogleUserAgentForPopup();
                     }
                   }
-
-                  popupController.addJavaScriptHandler(
-                    handlerName: 'NcupLocalStorageSetItem',
-                    callback: (List<dynamic> args) async {
-                      try {
-                        if (args.isEmpty) return null;
-                        final dynamic raw = args.first;
-                        if (raw is Map) {
-                          final String key = raw['key']?.toString() ?? '';
-                          final String value = raw['value']?.toString() ?? '';
-                          if (key.isNotEmpty) {
-                            final SharedPreferences prefs =
-                            await SharedPreferences.getInstance();
-                            await prefs.setString(key, value);
-                            WrLoggerService().WrLogInfo(
-                                'NcupLocalStorageSetItem (popup): saved key="$key" len=${value.length}');
-                          }
-                        }
-                      } catch (e, st) {
-                        WrLoggerService().WrLogError(
-                            'NcupLocalStorageSetItem popup handler error: $e\n$st');
-                      }
-                      return null;
-                    },
-                  );
-
-                  popupController.addJavaScriptHandler(
-                    handlerName: 'NcupCheckoutAction',
-                    callback: (List<dynamic> args) async {
-                      print('WERLOG: POPUP NcupCheckoutAction args=$args');
-                      if (args.isNotEmpty) {
-                        await _handleCheckoutAction(args.first);
-                      }
-                      return null;
-                    },
-                  );
-
-                  popupController.addJavaScriptHandler(
-                    handlerName: 'NcupPostMessage',
-                    callback: (List<dynamic> args) async {
-                      try {
-                        if (args.isEmpty) return null;
-                        final dynamic first = args.first;
-                        final dynamic dataToHandle =
-                        (first is Map && first['data'] != null)
-                            ? first['data']
-                            : first;
-                        await _handleCheckoutAction(dataToHandle);
-                      } catch (e) {
-                        print(
-                            'WERLOG: POPUP NcupPostMessage handler error: $e');
-                      }
-                      return null;
-                    },
-                  );
-
-                  popupController.addJavaScriptHandler(
-                    handlerName: 'NcupJSLogger',
-                    callback: (List<dynamic> args) {
-                      print('WERLOG: POPUP JS error payload: $args');
-                      return null;
-                    },
-                  );
                 },
                 onPermissionRequest: (controller, request) async {
                   return PermissionResponse(
@@ -3364,10 +2863,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                       setState(() {
                         _popupCurrentUrl = uri.toString();
                       });
-                    }
-
-                    if (_enableHarborLogic && !WrIsUnityGameUrl(uri)) {
-                      _scheduleSafeInstall(controller, label: 'popup');
                     }
                   }
 
@@ -3566,31 +3061,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                     unawaited(_shipDataToPage(reason: 'webview-created'));
 
                     controller.addJavaScriptHandler(
-                      handlerName: 'NcupLocalStorageSetItem',
-                      callback: (List<dynamic> args) async {
-                        try {
-                          if (args.isEmpty) return null;
-                          final dynamic raw = args.first;
-                          if (raw is Map) {
-                            final String key = raw['key']?.toString() ?? '';
-                            final String value = raw['value']?.toString() ?? '';
-                            if (key.isNotEmpty) {
-                              final SharedPreferences prefs =
-                              await SharedPreferences.getInstance();
-                              await prefs.setString(key, value);
-                              WrLoggerService().WrLogInfo(
-                                  'NcupLocalStorageSetItem (main): saved key="$key" len=${value.length}');
-                            }
-                          }
-                        } catch (e, st) {
-                          WrLoggerService().WrLogError(
-                              'NcupLocalStorageSetItem main handler error: $e\n$st');
-                        }
-                        return null;
-                      },
-                    );
-
-                    controller.addJavaScriptHandler(
                       handlerName: 'onServerResponse',
                       callback: (List<dynamic> args) async {
                         if (args.isEmpty) return null;
@@ -3611,147 +3081,16 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                           if (first is Map) {
                             final Map<dynamic, dynamic> root = first;
 
-                            if (root['savedata'] != null) {
-                              await WrHandleServerSavedata(
-                                  root['savedata'].toString());
-                              await _handleCheckoutAction(root['savedata']);
-                            }
-
                             _updateExtraDataFromServerPayload(root);
                             _updateSafeAreaFromServerPayload(root);
                             await _updateUserAgentFromServerPayload(root);
 
                             await _applyNormalUserAgentIfNeeded();
-
-                            try {
-                              if (!_loadedJsExecutedOnce &&
-                                  _enableHarborLogic) {
-                                final dynamic adataRaw = root['adata'];
-                                if (adataRaw is Map) {
-                                  final Map adata = adataRaw;
-                                  final dynamic loadedJsRaw = adata['loadedjs'];
-                                  if (loadedJsRaw != null) {
-                                    final String loadedJs =
-                                    loadedJsRaw.toString().trim();
-                                    if (loadedJs.isNotEmpty) {
-                                      _pendingLoadedJs = loadedJs;
-                                      WrLoggerService().WrLogInfo(
-                                        'loadedjs received, will execute ONCE after 6 seconds',
-                                      );
-
-                                      Future<void>.delayed(
-                                        const Duration(seconds: 6),
-                                            () async {
-                                          if (!mounted) return;
-                                          if (!_enableHarborLogic) {
-                                            WrLoggerService().WrLogInfo(
-                                                'Skipping loadedjs: savedata != true');
-                                            return;
-                                          }
-                                          if (_loadedJsExecutedOnce) {
-                                            WrLoggerService().WrLogInfo(
-                                                'Skipping loadedjs: already executed once');
-                                            return;
-                                          }
-                                          if (WrWebViewController == null) {
-                                            WrLoggerService().WrLogWarn(
-                                                'Skipping loadedjs execution: controller is null');
-                                            return;
-                                          }
-                                          try {
-                                            final Uri? url =
-                                            await WrWebViewController!
-                                                .getUrl();
-                                            if (WrIsUnityGameUrl(url)) {
-                                              WrLoggerService().WrLogInfo(
-                                                  'Skipping loadedjs on Unity page: $url');
-                                              return;
-                                            }
-                                          } catch (_) {}
-                                          final String? jsToRun =
-                                              _pendingLoadedJs;
-                                          if (jsToRun == null ||
-                                              jsToRun.isEmpty) {
-                                            return;
-                                          }
-                                          WrLoggerService().WrLogInfo(
-                                              'Executing loadedjs from server payload (ONCE, delayed 6s)');
-                                          try {
-                                            await WrWebViewController
-                                                ?.evaluateJavascript(
-                                              source: jsToRun,
-                                            );
-                                            _loadedJsExecutedOnce = true;
-                                          } catch (e, st) {
-                                            WrLoggerService().WrLogError(
-                                                'Error executing delayed loadedjs: $e\n$st');
-                                          }
-                                        },
-                                      );
-                                    }
-                                  }
-                                }
-                              } else {
-                                WrLoggerService().WrLogInfo(
-                                    'loadedjs ignored: already executed or savedata != true');
-                              }
-                            } catch (e, st) {
-                              WrLoggerService().WrLogError(
-                                  'Error scheduling loadedjs: $e\n$st');
-                            }
                           }
                         } catch (e, st) {
                           print('onServerResponse error: $e\n$st');
                         }
 
-                        return null;
-                      },
-                    );
-
-                    controller.addJavaScriptHandler(
-                      handlerName: 'NcupCheckoutAction',
-                      callback: (List<dynamic> args) async {
-                        try {
-                          print('WERLOG: MAIN NcupCheckoutAction args=$args');
-                          if (args.isNotEmpty) {
-                            await _handleCheckoutAction(args.first);
-                          }
-                        } catch (e) {
-                          print('WERLOG: MAIN NcupCheckoutAction error: $e');
-                        }
-                        return null;
-                      },
-                    );
-
-                    controller.addJavaScriptHandler(
-                      handlerName: 'NcupJSLogger',
-                      callback: (List<dynamic> args) {
-                        try {
-                          final dynamic payload =
-                          args.isNotEmpty ? args.first : null;
-                          print('WERLOG: MAIN JS error payload: $payload');
-                        } catch (e) {
-                          print('WERLOG: NcupJSLogger handler error: $e');
-                        }
-                        return null;
-                      },
-                    );
-
-                    controller.addJavaScriptHandler(
-                      handlerName: 'NcupPostMessage',
-                      callback: (List<dynamic> args) async {
-                        try {
-                          if (args.isEmpty) return null;
-                          final dynamic first = args.first;
-                          final dynamic dataToHandle =
-                          (first is Map && first['data'] != null)
-                              ? first['data']
-                              : first;
-                          await _handleCheckoutAction(dataToHandle);
-                        } catch (e) {
-                          print(
-                              'WERLOG: MAIN NcupPostMessage handler error: $e');
-                        }
                         return null;
                       },
                     );
@@ -3882,15 +3221,6 @@ class _WrHarborState extends State<WrHarbor> with WidgetsBindingObserver {
                     }
 
                     final bool isUnity = WrIsUnityGameUrl(uri);
-
-                    if (!_isAboutBlankUri(uri) &&
-                        !isUnity &&
-                        _enableHarborLogic) {
-                      _scheduleSafeInstall(controller, label: 'parent');
-                    } else if (isUnity) {
-                      WrLoggerService().WrLogInfo(
-                          'Unity page loaded — skip all Harbor injections: $uri');
-                    }
 
                     await debugPrintCurrentUserAgent();
 
